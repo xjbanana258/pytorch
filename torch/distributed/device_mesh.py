@@ -838,6 +838,87 @@ else:
             """
             return [self.get_group(i) for i in range(len(self._layout))]
 
+        def abort(self) -> None:
+            """
+            Abort all process groups associated with this DeviceMesh.
+
+            When a rank in a DeviceMesh exits prematurely, other ranks can call
+            this method to abort the mesh's process groups instead of hanging.
+            The abort is performed concurrently using ``ncclGroupStart``/
+            ``ncclGroupEnd`` semantics so that multiple NCCL communicator aborts
+            do not deadlock each other.
+
+            This method must be called on a root mesh. Calling it on a submesh
+            raises ``RuntimeError`` because the scope of a submesh abort is
+            ambiguous.
+
+            .. note:: This API is experimental and currently only works with the
+                NCCL backend.
+
+            .. note:: This API should be used with
+                ``TORCH_NCCL_ASYNC_ERROR_HANDLING`` turned off (i.e. set to 0).
+                Otherwise, ``ProcessGroupNCCL``'s watchdog may automatically
+                handle errors or timeouts including aborting the ProcessGroup.
+            """
+            from torch.distributed.distributed_c10d import (
+                _cleanup_process_group_global_state,
+                is_nccl_available,
+            )
+
+            if self._root_mesh is not None:
+                raise RuntimeError(
+                    "abort() is not supported on a submesh. "
+                    "Call abort() on the root mesh instead."
+                )
+
+            if not hasattr(self, "_dim_group_names"):
+                return
+
+            seen: set[str] = set()
+            pgs: list[ProcessGroup] = []
+            for name in self._dim_group_names:
+                if name not in seen:
+                    seen.add(name)
+                    pg = _resolve_process_group(name)
+                    if pg is not None:
+                        pgs.append(pg)
+
+            for flat_mesh in self._flatten_mapping.values():
+                if hasattr(flat_mesh, "_dim_group_names"):
+                    for name in flat_mesh._dim_group_names:
+                        if name not in seen:
+                            seen.add(name)
+                            pg = _resolve_process_group(name)
+                            if pg is not None:
+                                pgs.append(pg)
+
+            if not pgs:
+                return
+
+            nccl_backend = None
+            if is_nccl_available():
+                from torch._C._distributed_c10d import ProcessGroupNCCL
+
+                try:
+                    backend = pgs[0]._get_backend(
+                        torch.accelerator.current_accelerator()
+                        or torch.device("cpu")
+                    )
+                except RuntimeError:
+                    backend = None
+                if isinstance(backend, ProcessGroupNCCL):
+                    nccl_backend = backend
+
+            if nccl_backend is not None:
+                nccl_backend._group_start()
+            for pg in pgs:
+                pg.abort()
+            if nccl_backend is not None:
+                nccl_backend._group_end()
+
+            for pg in pgs:
+                _cleanup_process_group_global_state(pg)
+
         def _create_sub_mesh(
             self,
             layout: _MeshLayout,
