@@ -119,6 +119,71 @@ _FAKE_TENSOR_CONSTRUCTOR_IGNORED_STATE_ATTRS = frozenset(
 )
 
 
+def _maybe_dispatch_key(name: str) -> torch._C.DispatchKey | None:
+    return getattr(torch._C.DispatchKey, name, None)
+
+
+_AUTOCAST_DISPATCH_KEY_BY_DEVICE_TYPE = {
+    device_type: key
+    for device_type, key in (
+        ("cpu", _maybe_dispatch_key("AutocastCPU")),
+        ("mps", _maybe_dispatch_key("AutocastMPS")),
+        ("cuda", _maybe_dispatch_key("AutocastCUDA")),
+        ("xpu", _maybe_dispatch_key("AutocastXPU")),
+        ("ipu", _maybe_dispatch_key("AutocastIPU")),
+        ("hpu", _maybe_dispatch_key("AutocastHPU")),
+        ("xla", _maybe_dispatch_key("AutocastXLA")),
+        (
+            torch._C._get_privateuse1_backend_name(),
+            _maybe_dispatch_key("AutocastPrivateUse1"),
+        ),
+        ("mtia", _maybe_dispatch_key("AutocastMTIA")),
+        ("maia", _maybe_dispatch_key("AutocastMAIA")),
+    )
+    if key is not None
+}
+
+_AUTOCAST_DISPATCH_KEYS = tuple(_AUTOCAST_DISPATCH_KEY_BY_DEVICE_TYPE.values())
+
+
+def _extra_autocast_dispatch_keys(
+    device: torch.device | str,
+    dispatch_keys: torch.DispatchKeySet | None,
+) -> torch.DispatchKeySet | None:
+    if dispatch_keys is None:
+        return None
+
+    device_type = torch.device(device).type
+    default_autocast_key = _AUTOCAST_DISPATCH_KEY_BY_DEVICE_TYPE.get(device_type)
+    extra_keys = torch._C.DispatchKeySet.from_raw_repr(0)
+    for autocast_key in _AUTOCAST_DISPATCH_KEYS:
+        if autocast_key != default_autocast_key and dispatch_keys.has(autocast_key):
+            extra_keys = extra_keys.add(autocast_key)
+
+    if extra_keys.raw_repr() == 0:
+        return None
+    return extra_keys
+
+
+def _extra_autocast_dispatch_keys_for_tensor(
+    device: torch.device | str,
+    t: Tensor,
+) -> torch.DispatchKeySet | None:
+    if isinstance(t, FakeTensor):
+        if t.extra_dispatch_keys is not None:
+            return _extra_autocast_dispatch_keys(device, t.extra_dispatch_keys)
+        if t.dispatch_keys is not None:
+            return _extra_autocast_dispatch_keys(device, t.dispatch_keys)
+        return None
+
+    # XLA:CUDA tensors have device type XLA but use AutocastCUDA. Avoid probing
+    # ordinary tensors here, since Dynamo guards on direct dispatch-key reads.
+    if torch.device(device).type != "xla":
+        return None
+
+    return _extra_autocast_dispatch_keys(device, torch._C._dispatch_keys(t))
+
+
 # Check if device type supports device index
 @functools.cache
 def _is_indexed_device_type(device_type: str) -> bool:
@@ -515,9 +580,24 @@ class FakeTensorConverter:
         # This callback is used by both subclass and inner tensors. Require the
         # caller to explicitly specify the device in case outer and inner tensors
         # have different devices.
+        source_device = t.device
+        source_dispatch_keys = (
+            t.dispatch_keys
+            if isinstance(t, FakeTensor)
+            else (
+                torch._C._dispatch_keys(t)
+                if torch.device(source_device).type == "xla"
+                else None
+            )
+        )
+        source_extra_dispatch_keys = _extra_autocast_dispatch_keys_for_tensor(
+            source_device, t
+        )
+
         def mk_fake_tensor(
             make_meta_t: Callable[[], object], device: torch.device | str
         ) -> FakeTensor:
+            same_device = torch.device(device) == source_device
             # NB: don't use in_kernel_invocation_manager. to
             # ensure FakeTensor can internally do constant computation
             # as necessary.  Invocation manager is "more correct" as
@@ -535,6 +615,10 @@ class FakeTensorConverter:
                     # TODO: callback might be used in recursive contexts, in
                     # which case using t is wrong!  BUG!
                     constant=constant,
+                    dispatch_keys=source_dispatch_keys if same_device else None,
+                    extra_dispatch_keys=(
+                        source_extra_dispatch_keys if same_device else None
+                    ),
                 )
 
         out = self.meta_converter(
@@ -673,6 +757,7 @@ class FakeTensorConverter:
         device: torch.device,
         pytype: type[torch.Tensor] | None = None,
         dispatch_keys: torch.DispatchKeySet | None = None,
+        extra_dispatch_keys: torch.DispatchKeySet | None = None,
     ) -> FakeTensor:
         if t.device.type != "meta":
             raise AssertionError(
@@ -684,7 +769,12 @@ class FakeTensorConverter:
         if maybe_memo is not None:
             return maybe_memo
         out = FakeTensor(
-            fake_mode, t, device, pytype=pytype, dispatch_keys=dispatch_keys
+            fake_mode,
+            t,
+            device,
+            pytype=pytype,
+            dispatch_keys=dispatch_keys,
+            extra_dispatch_keys=extra_dispatch_keys,
         )
         self.set_tensor_memo(t, out)
         return out
@@ -850,9 +940,11 @@ class FakeTensor(Tensor):
 
     # FakeTensor doesn't fully emulate the original tensor's Python type
     # and dispatch key set, therefore sometimes we want to track them
-    # separately.
+    # separately.  dispatch_keys stores the full represented key set; extra
+    # dispatch keys stores only keys added to the FakeTensor wrapper.
     pytype: type[Tensor] | None
     dispatch_keys: torch.DispatchKeySet | None
+    extra_dispatch_keys: torch.DispatchKeySet | None
 
     # Indicates to our torch_dispatch dispatching infra that
     # this is an "infra" mode with lower dispatching precedence.
@@ -942,6 +1034,7 @@ class FakeTensor(Tensor):
         real_tensor: Tensor | None = None,
         pytype: type[Tensor] | None = None,
         dispatch_keys: torch.DispatchKeySet | None = None,
+        extra_dispatch_keys: torch.DispatchKeySet | None = None,
         *,
         fake_mode: FakeTensorMode | None = None,
         fake_device: torch.device | str | None = None,
@@ -1011,13 +1104,30 @@ class FakeTensor(Tensor):
                 "'device' (or 'fake_device')"
             )
 
-        self = Tensor._make_subclass(
-            cls,
-            elem,
-            elem.requires_grad if requires_grad is None else requires_grad,
-            dispatch_device=True,
-            device_for_backend_keys=device,
+        extra_autocast_dispatch_keys = _extra_autocast_dispatch_keys(
+            device, extra_dispatch_keys
         )
+        if extra_autocast_dispatch_keys is None:
+            extra_autocast_dispatch_keys = _extra_autocast_dispatch_keys(
+                device, dispatch_keys
+            )
+        if extra_autocast_dispatch_keys is not None:
+            self = Tensor._make_subclass(
+                cls,
+                elem,
+                elem.requires_grad if requires_grad is None else requires_grad,
+                dispatch_device=True,
+                device_for_backend_keys=device,
+                _extra_dispatch_keys=extra_autocast_dispatch_keys,
+            )
+        else:
+            self = Tensor._make_subclass(
+                cls,
+                elem,
+                elem.requires_grad if requires_grad is None else requires_grad,
+                dispatch_device=True,
+                device_for_backend_keys=device,
+            )
         if not fake_mode._allow_unsafe_data_ptr_access:
             torch._C._set_throw_on_mutable_data_ptr(self)
         else:
@@ -1044,6 +1154,7 @@ class FakeTensor(Tensor):
         self.constant = constant
         self.pytype = pytype
         self.dispatch_keys = dispatch_keys
+        self.extra_dispatch_keys = extra_autocast_dispatch_keys
         if isinstance(real_tensor, FakeTensor):
             raise AssertionError("real_tensor must not be a FakeTensor")
         self.real_tensor = real_tensor
@@ -1338,6 +1449,7 @@ class TensorMetadata:
     is_coalesced: bool | None
     dense_dim: int | None
     sparse_dim: int | None
+    extra_dispatch_keys: int
 
     def _flatten_into(
         self,
@@ -1399,6 +1511,16 @@ def extract_tensor_metadata(t: Tensor) -> TensorMetadata:
         t.is_coalesced() if t.is_sparse else None,
         t.dense_dim() if _is_sparse_any else None,
         t.sparse_dim() if _is_sparse_any else None,
+        (
+            extra_dispatch_keys.raw_repr()
+            if (
+                extra_dispatch_keys := _extra_autocast_dispatch_keys_for_tensor(
+                    t.device, t
+                )
+            )
+            is not None
+            else 0
+        ),
     )
 
 
@@ -2365,7 +2487,16 @@ class FakeTensorMode(TorchDispatchMode):
             with in_kernel_invocation_manager(self), maybe_suppress():
                 empty.set_(storage, storage_offset, shape, stride)
 
-        return FakeTensor(self, empty, metadata.device)
+        return FakeTensor(
+            self,
+            empty,
+            metadata.device,
+            extra_dispatch_keys=(
+                torch._C.DispatchKeySet.from_raw_repr(metadata.extra_dispatch_keys)
+                if metadata.extra_dispatch_keys
+                else None
+            ),
+        )
 
     def _output_from_cache_entry(
         self,
@@ -3291,6 +3422,8 @@ class FakeTensorMode(TorchDispatchMode):
         has_scalar_only_inputs = False
         preserve_dispatch_keys = False
         input_dispatch_keys = None
+        preserve_extra_dispatch_keys = False
+        input_extra_dispatch_keys = None
         if (
             (func is aten.alias.default or func is aten.detach.default)
             and len(flat_args) == 1
@@ -3298,6 +3431,27 @@ class FakeTensorMode(TorchDispatchMode):
         ):
             input_dispatch_keys = flat_args[0].dispatch_keys
             preserve_dispatch_keys = input_dispatch_keys is not None
+            input_extra_dispatch_keys = flat_args[0].extra_dispatch_keys
+            preserve_extra_dispatch_keys = input_extra_dispatch_keys is not None
+
+        def get_common_extra_dispatch_keys(
+            output_device: torch.device | str,
+        ) -> torch.DispatchKeySet | None:
+            output_device = torch.device(output_device)
+            found_keys = None
+            for arg in flat_args:
+                if not isinstance(arg, FakeTensor) or arg.device != output_device:
+                    continue
+                arg_extra_dispatch_keys = _extra_autocast_dispatch_keys_for_tensor(
+                    output_device, arg
+                )
+                if arg_extra_dispatch_keys is None:
+                    continue
+                if found_keys is not None and found_keys != arg_extra_dispatch_keys:
+                    return None
+                found_keys = arg_extra_dispatch_keys
+
+            return found_keys
 
         def wrap(e: T) -> T | FakeTensor:
             nonlocal common_device
@@ -3320,6 +3474,8 @@ class FakeTensorMode(TorchDispatchMode):
                 )
                 if preserve_dispatch_keys:
                     e.dispatch_keys = input_dispatch_keys
+                if preserve_extra_dispatch_keys:
+                    e.extra_dispatch_keys = input_extra_dispatch_keys
                 return cast(T, e)
             elif converter is not None:
                 if has_scalar_only_inputs:
@@ -3328,11 +3484,19 @@ class FakeTensorMode(TorchDispatchMode):
                     # We thus directly convert real tensor to fake tensor.
                     out = converter.from_real_tensor(self, e)
                 else:
+                    output_device = device or common_device
                     out = converter.from_meta_and_device(
-                        self, e, device or common_device
+                        self,
+                        e,
+                        output_device,
+                        extra_dispatch_keys=get_common_extra_dispatch_keys(
+                            output_device
+                        ),
                     )
                 if preserve_dispatch_keys:
                     out.dispatch_keys = input_dispatch_keys
+                if preserve_extra_dispatch_keys:
+                    out.extra_dispatch_keys = input_extra_dispatch_keys
                 return out
             else:
                 # pyrefly: ignore [bad-return]

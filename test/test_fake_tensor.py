@@ -1008,6 +1008,93 @@ class FakeTensorTest(TestCase):
                 self.assertEqual(y_unwrapped.layout, torch.strided)
                 self.assertEqual(y_unwrapped.stride(), (3, 1))
 
+    def test_from_meta_and_device_preserves_full_dispatch_keys(self):
+        x = torch.randn(4, 3, dtype=torch.complex64)
+        torch._C._set_conj(x, not x.is_conj())
+        dispatch_keys = torch._C._dispatch_keys(x)
+
+        mode = FakeTensorMode()
+        fake_x = mode.fake_tensor_converter.from_meta_and_device(
+            mode,
+            torch.empty_like(x, device="meta"),
+            x.device,
+            dispatch_keys=dispatch_keys,
+        )
+
+        self.assertEqual(fake_x.dispatch_keys, dispatch_keys)
+        self.assertIsNone(fake_x.extra_dispatch_keys)
+
+    @unittest.skipIf(not RUN_CUDA, "requires CUDA autocast")
+    @expectedFailurePropagateRealTensors
+    def test_fake_xla_cuda_autocast_dispatch_keys(self):
+        class XLACUDATensor(torch.Tensor):
+            @staticmethod
+            def __new__(cls):
+                return torch.Tensor._make_wrapper_subclass(
+                    cls,
+                    (5, 5),
+                    (5, 1),
+                    0,
+                    None,
+                    torch.float16,
+                    torch.strided,
+                    torch.device("xla"),
+                    False,
+                    False,
+                    None,
+                    False,
+                    False,
+                    torch._C.DispatchKeySet(torch._C.DispatchKey.AutocastCUDA),
+                )
+
+            @classmethod
+            def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+                return NotImplemented
+
+        x = XLACUDATensor()
+        mode = FakeTensorMode()
+        fake_x = mode.from_tensor(x)
+        autocast_key = torch._C.DispatchKey.AutocastCUDA
+
+        self.assertTrue(torch._C._dispatch_keys(fake_x).has(autocast_key))
+        self.assertTrue(fake_x.dispatch_keys.has(autocast_key))
+        self.assertTrue(fake_x.extra_dispatch_keys.has(autocast_key))
+
+        op = torch.ops.aten.norm.ScalarOpt_dim
+
+        def f(a):
+            with torch.amp.autocast("cuda", dtype=torch.float16):
+                return op(a, 2, [1])
+
+        with mode:
+            out = f(fake_x)
+        self.assertEqual(out.dtype, torch.float32)
+        self.assertTrue(torch._C._dispatch_keys(out).has(autocast_key))
+        self.assertIsNone(out.dispatch_keys)
+        self.assertTrue(out.extra_dispatch_keys.has(autocast_key))
+
+        with mode:
+            alias_out = torch.ops.aten.alias.default(out)
+            detach_out = torch.ops.aten.detach.default(out)
+        for view_out in (alias_out, detach_out):
+            self.assertTrue(torch._C._dispatch_keys(view_out).has(autocast_key))
+            self.assertIsNone(view_out.dispatch_keys)
+            self.assertTrue(view_out.extra_dispatch_keys.has(autocast_key))
+
+        symbolic_mode = FakeTensorMode(shape_env=ShapeEnv())
+        symbolic_fake_x = symbolic_mode.from_tensor(x)
+        with symbolic_mode:
+            add_out = torch.ops.aten.add.Tensor(symbolic_fake_x, 1)
+        self.assertTrue(torch._C._dispatch_keys(add_out).has(autocast_key))
+        self.assertIsNone(add_out.dispatch_keys)
+        self.assertTrue(add_out.extra_dispatch_keys.has(autocast_key))
+
+        gm = make_fx(f, tracing_mode="fake")(x)
+        call_targets = [
+            node.target for node in gm.graph.nodes if node.op == "call_function"
+        ]
+        self.assertEqual(call_targets, [torch.ops.aten.norm.ScalarOpt_dim_dtype])
+
     def test_compare_tensor_meta_unbacked_numel(self):
         from torch.fx.experimental.symbolic_shapes import _constrain_range_for_size
 
@@ -3568,6 +3655,7 @@ class FakeTensorDispatchCache(TestCase):
             z = torch.randn(4, 3, requires_grad=True)
             self._test_cache_key(fm, x, y, z)
 
+    @skipIfTorchDynamo("mutates private dispatch key state")
     def test_cache_key_is_conj(self):
         with FakeTensorMode() as fm:
             x = torch.randn(4, 3, dtype=torch.complex64)
@@ -3576,6 +3664,7 @@ class FakeTensorDispatchCache(TestCase):
             torch._C._set_conj(z, not z.is_conj())
             self._test_cache_key(fm, x, y, z)
 
+    @skipIfTorchDynamo("mutates private dispatch key state")
     def test_cache_key_is_neg(self):
         with FakeTensorMode() as fm:
             x = torch.randn(4, 3, dtype=torch.complex64)

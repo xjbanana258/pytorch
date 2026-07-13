@@ -37,6 +37,7 @@ from torch._prims_common import (
     ShapeType,
 )
 from torch._subclasses.fake_tensor import (
+    _extra_autocast_dispatch_keys_for_tensor,
     DataDependentOutputException,
     DynamicOutputShapeException,
     FakeTensor,
@@ -2257,7 +2258,13 @@ def _fake_alias(fake_mode: FakeTensorMode, x: FakeTensor) -> FakeTensor:
         out = aten.alias.default(x)
     # Real MKLDNN alias is not public API, but compiler-generated alias nodes
     # must preserve fake MKLDNN layout state through tracing.
-    return FakeTensor(fake_mode, out, x.device, dispatch_keys=x.dispatch_keys)
+    return FakeTensor(
+        fake_mode,
+        out,
+        x.device,
+        dispatch_keys=x.dispatch_keys,
+        extra_dispatch_keys=x.extra_dispatch_keys,
+    )
 
 
 @register_op_impl(aten.alias.default)
@@ -2416,6 +2423,23 @@ def make_fast_binary_impl(
             elif op.device != common_device:
                 return slow("error")
 
+        common_extra_dispatch_keys = None
+        for op in operands:
+            if not isinstance(op, FakeTensor) or op.device != common_device:
+                continue
+            op_extra_dispatch_keys = _extra_autocast_dispatch_keys_for_tensor(
+                common_device, op
+            )
+            if op_extra_dispatch_keys is None:
+                continue
+            if (
+                common_extra_dispatch_keys is not None
+                and common_extra_dispatch_keys != op_extra_dispatch_keys
+            ):
+                common_extra_dispatch_keys = None
+                break
+            common_extra_dispatch_keys = op_extra_dispatch_keys
+
         # compute_fast_setup_type
         definitely_contiguous = True
         definitely_channels_last = True
@@ -2451,6 +2475,7 @@ def make_fast_binary_impl(
                     memory_format=torch.contiguous_format,
                 ),
                 device=common_device,
+                extra_dispatch_keys=common_extra_dispatch_keys,
             )
         if definitely_channels_last:
             count_label("fast channels_last")
@@ -2464,6 +2489,7 @@ def make_fast_binary_impl(
                     memory_format=torch.channels_last,
                 ),
                 device=common_device,
+                extra_dispatch_keys=common_extra_dispatch_keys,
             )
 
         return slow("no contiguity match")
@@ -2479,6 +2505,7 @@ def fast_detach(
     with no_python_dispatcher(), in_kernel_invocation_manager(fake_mode):
         out = torch.ops.aten.detach.default(x)
     dispatch_keys = x.dispatch_keys
+    extra_dispatch_keys = x.extra_dispatch_keys
     if include_real:
         return FakeTensor(
             fake_mode,
@@ -2486,8 +2513,15 @@ def fast_detach(
             x.device,
             real_tensor=x.real_tensor,
             dispatch_keys=dispatch_keys,
+            extra_dispatch_keys=extra_dispatch_keys,
         )
-    return FakeTensor(fake_mode, out, x.device, dispatch_keys=dispatch_keys)
+    return FakeTensor(
+        fake_mode,
+        out,
+        x.device,
+        dispatch_keys=dispatch_keys,
+        extra_dispatch_keys=extra_dispatch_keys,
+    )
 
 
 def fast_alias(fake_mode: FakeTensorMode, x: FakeTensor) -> FakeTensor:
