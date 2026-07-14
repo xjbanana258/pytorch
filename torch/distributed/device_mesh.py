@@ -844,25 +844,18 @@ else:
 
             When a rank in a DeviceMesh exits prematurely, other ranks can call
             this method to abort the mesh's process groups instead of hanging.
-            The abort is performed concurrently using ``ncclGroupStart``/
-            ``ncclGroupEnd`` semantics so that multiple NCCL communicator aborts
-            do not deadlock each other.
 
             This method must be called on a root mesh. Calling it on a submesh
             raises ``RuntimeError`` because the scope of a submesh abort is
             ambiguous.
 
-            .. note:: This API is experimental and currently only works with the
-                NCCL backend.
-
-            .. note:: This API should be used with
-                ``TORCH_NCCL_ASYNC_ERROR_HANDLING`` turned off (i.e. set to 0).
-                Otherwise, ``ProcessGroupNCCL``'s watchdog may automatically
-                handle errors or timeouts including aborting the ProcessGroup.
+            .. note:: This API is experimental. For NCCL backends, aborts are
+                performed concurrently using group semantics to avoid deadlocks.
+                For other backends, ``abort()`` is called serially on each
+                process group.
             """
             from torch.distributed.distributed_c10d import (
                 _cleanup_process_group_global_state,
-                is_nccl_available,
             )
 
             if self._root_mesh is not None:
@@ -895,26 +888,19 @@ else:
             if not pgs:
                 return
 
-            nccl_backend = None
-            if is_nccl_available():
-                from torch._C._distributed_c10d import ProcessGroupNCCL
+            try:
+                device = torch.accelerator.current_accelerator() or torch.device("cpu")
+                backend = pgs[0]._get_backend(device)
+            except RuntimeError:
+                backend = None
 
-                try:
-                    backend = pgs[0]._get_backend(
-                        torch.accelerator.current_accelerator()
-                        or torch.device("cpu")
-                    )
-                except RuntimeError:
-                    backend = None
-                if isinstance(backend, ProcessGroupNCCL):
-                    nccl_backend = backend
-
-            if nccl_backend is not None:
-                nccl_backend._group_start()
+            use_group = backend is not None and hasattr(backend, "_group_start")
+            if use_group:
+                backend._group_start()
             for pg in pgs:
                 pg.abort()
-            if nccl_backend is not None:
-                nccl_backend._group_end()
+            if use_group:
+                backend._group_end()
 
             for pg in pgs:
                 _cleanup_process_group_global_state(pg)
