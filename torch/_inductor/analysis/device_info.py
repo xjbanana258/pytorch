@@ -307,7 +307,11 @@ def datasheet_dram_bw(device: torch.device | None = None) -> float | None:
 
 
 def datasheet_tops(
-    dtype: torch.dtype, is_tf32: bool = False, device_name: str | None = None, *, device: torch.device | None = None
+    dtype: torch.dtype,
+    is_tf32: bool = False,
+    device_name: str | None = None,
+    *,
+    device: torch.device | None = None,
 ) -> float | None:
     """
     Get the theoretical *dense* TFLOPS of the device for a given dtype.
@@ -317,10 +321,10 @@ def datasheet_tops(
     callers always receive the throughput achievable by cuBLAS/cuDNN on
     non-sparse data.
 
-    If ``device_name`` is given, the datasheet is looked up for that named 
+    If ``device_name`` is given, the datasheet is looked up for that named
     device instead of querying the current device. This lets callers pin a
-    device spec for deterministic, hardware-independent estimates.  
-    
+    device spec for deterministic, hardware-independent estimates.
+
     If ``device`` is given, the name of that specific torch device is used.
     """
     if device_name is not None:
@@ -364,4 +368,3 @@ def datasheet_dram_bw_gbs(device_name: str) -> float | None:
         log.info("Device %s not in datasheet, returning None", device_name)
         return None
     return device_info.dram_bw_gbs
-

@@ -1,9 +1,6 @@
 import torch
 import torch.utils._pytree as pytree
-from torch._inductor.analysis.device_info import (
-    datasheet_dram_bw_gbs, 
-     datasheet_tops,
-)
+from torch._inductor.analysis.device_info import datasheet_dram_bw_gbs, datasheet_tops
 from torch._inductor.utils import get_device_tflops, get_gpu_dram_gbps
 from torch.fx.experimental.symbolic_shapes import (
     optimization_hint,
@@ -233,14 +230,10 @@ def get_transfer_time(
         return 0.0
 
     read_bytes = sum(
-        get_num_bytes(t)
-        for t in flat_args_kwargs
-        if isinstance(t, torch.Tensor)
+        get_num_bytes(t) for t in flat_args_kwargs if isinstance(t, torch.Tensor)
     )
     write_bytes = sum(
-        get_num_bytes(t)
-        for t in flat_outs
-        if isinstance(t, torch.Tensor)
+        get_num_bytes(t) for t in flat_outs if isinstance(t, torch.Tensor)
     )
     counted_bytes = read_bytes + write_bytes
 
