@@ -32,6 +32,8 @@ class TestScriptModuleInstanceAttributeTypeAnnotation(JitTestCase):
 
         with warnings.catch_warnings(record=True) as w:
             self.checkModule(M(), (1,))
+        # torch.jit.script now emits a visible deprecation warning; ignore it.
+        w = [x for x in w if "Please switch to `torch." not in str(x.message)]
         if len(w) != 0:
             raise AssertionError(f"Expected no warnings, got {len(w)}: {w}")
 
@@ -47,6 +49,8 @@ class TestScriptModuleInstanceAttributeTypeAnnotation(JitTestCase):
 
         with warnings.catch_warnings(record=True) as w:
             self.checkModule(M(), ([1, 2, 3],))
+        # torch.jit.script now emits a visible deprecation warning; ignore it.
+        w = [x for x in w if "Please switch to `torch." not in str(x.message)]
         if len(w) != 0:
             raise AssertionError(f"Expected no warnings, got {len(w)}: {w}")
 
@@ -62,6 +66,8 @@ class TestScriptModuleInstanceAttributeTypeAnnotation(JitTestCase):
 
         with warnings.catch_warnings(record=True) as w:
             self.checkModule(M(), (torch.rand(2, 3),))
+        # torch.jit.script now emits a visible deprecation warning; ignore it.
+        w = [x for x in w if "Please switch to `torch." not in str(x.message)]
         if len(w) != 0:
             raise AssertionError(f"Expected no warnings, got {len(w)}: {w}")
 
@@ -77,6 +83,8 @@ class TestScriptModuleInstanceAttributeTypeAnnotation(JitTestCase):
 
         with warnings.catch_warnings(record=True) as w:
             self.checkModule(M(), ([1, 2, 3],))
+        # torch.jit.script now emits a visible deprecation warning; ignore it.
+        w = [x for x in w if "Please switch to `torch." not in str(x.message)]
         if len(w) != 0:
             raise AssertionError(f"Expected no warnings, got {len(w)}: {w}")
 
@@ -94,6 +102,8 @@ class TestScriptModuleInstanceAttributeTypeAnnotation(JitTestCase):
 
         with warnings.catch_warnings(record=True) as w:
             self.checkModule(M(), ([1, 2, 3],))
+        # torch.jit.script now emits a visible deprecation warning; ignore it.
+        w = [x for x in w if "Please switch to `torch." not in str(x.message)]
         if len(w) != 0:
             raise AssertionError(f"Expected no warnings, got {len(w)}: {w}")
 
@@ -111,6 +121,8 @@ class TestScriptModuleInstanceAttributeTypeAnnotation(JitTestCase):
 
         with warnings.catch_warnings(record=True) as w:
             self.checkModule(M(), ([1, 2, 3],))
+        # torch.jit.script now emits a visible deprecation warning; ignore it.
+        w = [x for x in w if "Please switch to `torch." not in str(x.message)]
         if len(w) != 0:
             raise AssertionError(f"Expected no warnings, got {len(w)}: {w}")
 
@@ -128,6 +140,8 @@ class TestScriptModuleInstanceAttributeTypeAnnotation(JitTestCase):
 
         with warnings.catch_warnings(record=True) as w:
             self.checkModule(M(), ([1, 2, 3],))
+        # torch.jit.script now emits a visible deprecation warning; ignore it.
+        w = [x for x in w if "Please switch to `torch." not in str(x.message)]
         if len(w) != 0:
             raise AssertionError(f"Expected no warnings, got {len(w)}: {w}")
 
