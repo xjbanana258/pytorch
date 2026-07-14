@@ -107,8 +107,13 @@ from .base import (
     _RICHCOMPARE_OPS,
     AsPythonConstantNotImplementedError,
     AttrMutationKind,
+    GetSet,
+    Member,
+    Method,
+    MethodFlags,
     MutationType,
     NO_SUCH_SUBOBJ,
+    read,
     ValueMutationNew,
     VariableTracker,
 )
@@ -4330,16 +4335,21 @@ class UserDefinedExceptionObjectVariable(UserDefinedObjectVariable):
             return self._base_vt.call_method(tx, name, args, kwargs)  # type: ignore[missing-attribute]
         return super().call_method(tx, name, args, kwargs)
 
-    def getattro_impl(self, tx: "InstructionTranslatorBase", name: str):
-        if name in (
-            "args",
-            "__cause__",
-            "__context__",
-            "__suppress_context__",
-            "__traceback__",
-        ):
-            return self._base_vt.getattro_impl(tx, name)  # type: ignore[missing-attribute]
-        return super().getattro_impl(tx, name)
+    # BaseException args/__cause__/__context__/__suppress_context__/__traceback__
+    # are members/getsets; delegate each to the wrapped base exception VT.
+    tp_members = {
+        "args": Member(lambda s, tx: s._base_vt.getattro_impl(tx, "args")),
+        "__cause__": Member(lambda s, tx: s._base_vt.getattro_impl(tx, "__cause__")),
+        "__context__": Member(
+            lambda s, tx: s._base_vt.getattro_impl(tx, "__context__")
+        ),
+        "__suppress_context__": Member(
+            lambda s, tx: s._base_vt.getattro_impl(tx, "__suppress_context__")
+        ),
+        "__traceback__": Member(
+            lambda s, tx: s._base_vt.getattro_impl(tx, "__traceback__")
+        ),
+    }
 
     @property
     def __context__(self) -> "ConstantVariable":
@@ -4400,13 +4410,32 @@ class InspectVariable(UserDefinedObjectVariable):
     def is_matching_class(obj: object) -> bool:
         return obj in InspectVariable._PROPERTY_REDIRECTS
 
-    def getattro_impl(
+    def _redirect(
         self, tx: "InstructionTranslatorBase", name: str
-    ) -> VariableTracker:
+    ) -> VariableTracker | None:
         redirects = self._PROPERTY_REDIRECTS.get(type(self.value), {})
         if name in redirects:
             return super().getattro_impl(tx, redirects[name])
-        return super().getattro_impl(tx, name)
+        return None
+
+    def _parameters(self, tx: "InstructionTranslatorBase") -> VariableTracker | None:
+        return self._redirect(tx, "parameters")
+
+    def _kind(self, tx: "InstructionTranslatorBase") -> VariableTracker | None:
+        return self._redirect(tx, "kind")
+
+    def _name(self, tx: "InstructionTranslatorBase") -> VariableTracker | None:
+        return self._redirect(tx, "name")
+
+    # inspect.Signature.parameters and inspect.Parameter.name/.kind are Python
+    # `property` objects (getset-like). Redirect to the private backing slots to
+    # avoid tracing the property getters. The redirect is per-type, so a getter
+    # declines (returns None) when the attribute doesn't apply to self.value.
+    tp_getset = {
+        "parameters": GetSet(_parameters, None),
+        "kind": GetSet(_kind, None),
+        "name": GetSet(_name, None),
+    }
 
 
 class KeyedJaggedTensorVariable(UserDefinedObjectVariable):
@@ -4496,21 +4525,15 @@ class RemovableHandleVariable(VariableTracker):
         self.mutation_type = mutation_type
         self.idx = idx
 
-    def call_method(
-        self,
-        tx: "InstructionTranslatorBase",
-        name: str,
-        args: list[VariableTracker],
-        kwargs: dict[str, VariableTracker],
-    ) -> VariableTracker:
-        if name == "remove":
-            if self.idx != self.REMOVED:
-                if self.idx is None:
-                    raise AssertionError("idx must not be None for hook removal")
-                tx.output.side_effects.remove_hook(self.idx)
-                self.idx = self.REMOVED
-            return variables.ConstantVariable.create(None)
-        return super().call_method(tx, name, args, kwargs)
+    def remove(self, tx, args, kwargs):
+        if self.idx != self.REMOVED:
+            if self.idx is None:
+                raise AssertionError("idx must not be None for hook removal")
+            tx.output.side_effects.remove_hook(self.idx)
+            self.idx = self.REMOVED
+        return variables.ConstantVariable.create(None)
+
+    tp_methods = {"remove": Method(remove, MethodFlags.NOARGS)}
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
         if self.idx == self.REMOVED:
@@ -4947,13 +4970,20 @@ class DefaultDictVariable(UserDefinedDictVariable):
             f"{tracked_repr(tx, self._base_vt)})",
         )
 
+    # ref: defdict_members[] in CPython Modules/_collectionsmodule.c
+    # {"default_factory", T_OBJECT, offsetof(defdictobject, default_factory)}
+    tp_members = {
+        "default_factory": Member(read(lambda s: s.default_factory)),
+    }
+
     def getattro_impl(
         self,
         tx: "InstructionTranslatorBase",
         name: str,
     ) -> VariableTracker:
-        if name == "default_factory":
-            return self.default_factory
+        # UserDefinedObjectVariable.getattro_impl does not delegate to the base
+        # VariableTracker.getattro_impl, so the tp_getset/tp_members tables must
+        # be consulted here before falling through to the generic dispatch.
         return super().getattro_impl(tx, name)
 
     def _missing_impl(
@@ -5255,15 +5285,19 @@ class UserDefinedDequeVariable(UserDefinedObjectVariable):
         if self._base_vt is None:
             raise AssertionError("_base_vt must not be None after initialization")
 
-    def getattro_impl(
-        self, tx: "InstructionTranslatorBase", name: str
-    ) -> VariableTracker:
+    def _maxlen(self, tx: "InstructionTranslatorBase") -> VariableTracker | None:
         # maxlen is a read-only getset on deque, not a method, so it is not
         # covered by the _base_methods call_method delegation; route it to the
         # DequeVariable which tracks maxlen on the base deque.
-        if name == "maxlen" and self._base_vt is not None:
-            return self._base_vt.getattro_impl(tx, name)
-        return super().getattro_impl(tx, name)
+        if self._base_vt is not None:
+            return self._base_vt.getattro_impl(tx, "maxlen")
+        return None
+
+    # ref: deque_getset[] in CPython Modules/_collectionsmodule.c; maxlen is a
+    # read-only getset (deque_get_maxlen, no setter).
+    tp_getset = {
+        "maxlen": GetSet(_maxlen, None),
+    }
 
 
 class UserDefinedTupleVariable(UserDefinedObjectVariable):
