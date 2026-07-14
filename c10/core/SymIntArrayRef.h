@@ -5,11 +5,75 @@
 #include <c10/util/DimVector.h>
 #include <c10/util/Exception.h>
 #include <c10/util/irange.h>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <optional>
 
 namespace c10 {
 using SymIntArrayRef = ArrayRef<SymInt>;
+
+inline bool symIntArrayRefElementIsHeapAllocated(
+    c10::SymIntArrayRef ar,
+    size_t index) {
+#ifdef C10_MOBILE
+  return false;
+#else
+  // SymIntArrayRef can be a view over IntArrayRef storage through
+  // fromIntArrayRefSlow. In that case the bytes use SymInt's inline
+  // representation, but no SymInt objects are alive, so validation must inspect
+  // the shared one-word representation instead of calling SymInt methods.
+  static_assert(sizeof(SymInt) == sizeof(int64_t));
+  int64_t raw_data = 0;
+  std::memcpy(
+      &raw_data,
+      reinterpret_cast<const char*>(ar.data()) + index * sizeof(raw_data),
+      sizeof(raw_data));
+  // This is equivalent to !SymInt::check_range(raw_data), but only the
+  // representation bits participate in the branch.  A signed range comparison
+  // can make Valgrind treat unrelated payload bits as control-flow inputs.
+  const auto raw_bits = static_cast<uint64_t>(raw_data);
+  constexpr uint64_t sign_bit = uint64_t{1} << 63;
+  constexpr uint64_t small_negative_bit = uint64_t{1} << 62;
+  return (raw_bits & sign_bit) != 0 && (raw_bits & small_negative_bit) == 0;
+#endif
+}
+
+[[noreturn]] inline void reportSymIntArrayRefToIntArrayRefError(
+    c10::SymIntArrayRef ar,
+    size_t problem_index,
+    const char* file,
+    int64_t line) {
+  const bool is_symbolic = ar[problem_index].is_symbolic();
+  TORCH_CHECK(
+      false,
+      file,
+      ":",
+      line,
+      ": SymIntArrayRef expected to contain only concrete integers that are "
+      "stored inline and can be viewed as an IntArrayRef. Found ",
+      is_symbolic ? "symbolic SymInt" : "heap-allocated concrete SymInt",
+      " at index ",
+      problem_index,
+      ": ",
+      ar[problem_index],
+      " in SymIntArrayRef ",
+      ar,
+      is_symbolic
+          ? ". This commonly happens when an operator/kernel does not support "
+            "symbolic shapes at this dispatch key. Common causes include "
+            "calling an eager factory/kernel with a symbolic shape outside "
+            "FakeTensorMode, an operator/kernel missing SymInt support, or "
+            "running under a Python dispatch mode without the Python "
+            "dispatcher enabled. If this is expected during fake/meta "
+            "tracing, make sure FakeTensorMode and the Python dispatcher are "
+            "active; otherwise specialize or guard the symbolic size before "
+            "this call."
+          : ". This value is concrete, but the non-owning IntArrayRef "
+            "conversion used here cannot represent heap-allocated SymInt "
+            "values. Use an owning conversion or guard/specialize the value "
+            "before this call.");
+}
 
 inline at::IntArrayRef asIntArrayRefUnchecked(c10::SymIntArrayRef ar) {
   return IntArrayRef(reinterpret_cast<const int64_t*>(ar.data()), ar.size());
@@ -23,8 +87,8 @@ inline at::IntArrayRef asIntArrayRefUnchecked(c10::SymIntArrayRef ar) {
 
 inline std::optional<at::IntArrayRef> asIntArrayRefSlowOpt(
     c10::SymIntArrayRef ar) {
-  for (const c10::SymInt& sci : ar) {
-    if (sci.is_heap_allocated()) {
+  for (const auto i : c10::irange(ar.size())) {
+    if (symIntArrayRefElementIsHeapAllocated(ar, i)) {
       return std::nullopt;
     }
   }
@@ -36,13 +100,10 @@ inline at::IntArrayRef asIntArrayRefSlow(
     c10::SymIntArrayRef ar,
     const char* file,
     int64_t line) {
-  for (const c10::SymInt& sci : ar) {
-    TORCH_CHECK(
-        !sci.is_heap_allocated(),
-        file,
-        ":",
-        line,
-        ": SymIntArrayRef expected to contain only concrete integers");
+  for (const auto i : c10::irange(ar.size())) {
+    if (C10_UNLIKELY(symIntArrayRefElementIsHeapAllocated(ar, i))) {
+      reportSymIntArrayRefToIntArrayRefError(ar, i, file, line);
+    }
   }
   return asIntArrayRefUnchecked(ar);
 }
@@ -90,9 +151,16 @@ inline c10::SymBool sym_equals(SymIntArrayRef LHS, SymIntArrayRef RHS) {
   if (LHS.size() != RHS.size()) {
     return c10::SymBool(false);
   }
+  if (LHS.empty()) {
+    return c10::SymBool(true);
+  }
 
-  c10::SymBool result = sym_eq(LHS.size(), RHS.size());
-  for (size_t i = 0; i < RHS.size(); ++i) {
+  c10::SymBool result = sym_eq(LHS[0], RHS[0]);
+  std::optional<bool> result_bool = result.maybe_as_bool();
+  if (result_bool.has_value() && !*result_bool) {
+    return result;
+  }
+  for (size_t i = 1; i < RHS.size(); ++i) {
     c10::SymBool equals = sym_eq(LHS[i], RHS[i]);
     std::optional<bool> equals_bool = equals.maybe_as_bool();
 
