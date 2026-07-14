@@ -9018,6 +9018,30 @@ class DeviceCopy(ExternKernelOut):
             wrapper.codegen_device_copy(args[0], self.codegen_reference(), args[1])
         if isinstance(self.layout, Layout) and self.layout.is_pinned:
             wrapper.sync_d2h_copy(self.get_name())
+        if self.should_sync_h2d_data_ptr_copy():
+            wrapper.sync_h2d_copy(self.get_name())
+
+    def should_sync_h2d_data_ptr_copy(self) -> bool:
+        # This intentionally over-approximates to any pinned CPU->GPU copy in a
+        # graph with traced data_ptr, since the pointer table copy has no direct
+        # edge back to the keepalive source tensors whose addresses escaped.
+        if not V.graph.data_ptr_keepalive_buffers:
+            return False
+        if not self.constant_args or self.constant_args[0] is not True:
+            return False
+        if not isinstance(self.layout, Layout):
+            return False
+        device = self.layout.device
+        if device is None or not is_gpu(device.type):
+            return False
+        if not is_node_sequence(self.inputs):
+            return False
+        src = self.inputs[0]
+        src_device = src.get_device()
+        if src_device is None or src_device.type != "cpu":
+            return False
+        src_layout = src.maybe_get_layout()
+        return isinstance(src_layout, Layout) and src_layout.is_pinned
 
 
 class DynamicSelectStorageOffset(ExternKernel):
@@ -9262,6 +9286,19 @@ class FallbackKernel(ExternKernelAlloc):
         self.op_overload = kernel
         self.unflatten_args = unflatten_args
         self.kwargs = {} if kwargs is None else kwargs
+        if (
+            isinstance(self.op_overload, torch._ops.OpOverload)
+            and self.op_overload.name() == "prims::_data_ptr"
+        ):
+            # The returned integer can escape through tensor constructors into
+            # user kernels, so preserve the source tensor's address and storage.
+            for arg in tensor_args:
+                name = arg.get_name()
+                try:
+                    idx: int | None = V.graph.graph_input_names.index(name)
+                except ValueError:
+                    idx = None
+                V.graph.mark_data_ptr_keepalive_buffer(name, idx)
         if self.python_kernel_name is None:
             raise AssertionError("Expected self.python_kernel_name is not None")
         V.graph.warn_fallback(self.python_kernel_name)
@@ -9386,9 +9423,41 @@ class FallbackKernel(ExternKernelAlloc):
         return read_writes
 
     def codegen_unbacked_symbol_defs(self, wrapper: PythonWrapperCodegen) -> None:
+        unbacked_bindings = getattr(self, "unbacked_bindings", None)
+        if V.graph.cpp_wrapper and unbacked_bindings:
+            resolved = resolve_unbacked_bindings(
+                V.graph.sizevars.shape_env, unbacked_bindings
+            )
+            if resolved is None:
+                raise AssertionError(
+                    "Expected cpp_wrapper unbacked bindings to resolve"
+                )
+            unbacked_bindings = resolved
+            direct_symbol_outputs = OrderedSet(
+                [
+                    output
+                    for output in pytree.tree_leaves(self.codegen_outputs())
+                    if isinstance(output, sympy.Symbol)
+                ]
+            )
+            if direct_symbol_outputs:
+                unbacked_bindings = {
+                    k: v
+                    for k, v in unbacked_bindings.items()
+                    if k not in direct_symbol_outputs
+                }
         return wrapper.codegen_unbacked_symbol_defs_for_outputs(
-            self.get_name(), self.outputs, getattr(self, "unbacked_bindings", None)
+            self.get_name(),
+            self.codegen_outputs(),
+            unbacked_bindings,
         )
+
+    def codegen_outputs(self) -> Sequence[Any]:
+        if self.outputs:
+            return self.outputs
+        if isinstance(self.layout, Layout):
+            return [self]
+        return self.mutation_outputs
 
     def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
         if unbacked_bindings := getattr(self, "unbacked_bindings", None):
