@@ -3264,11 +3264,11 @@ def get_gpu_dram_gbps(device: torch.device | None = None) -> float:
     if not torch.cuda.is_available():
         log.warning("get_gpu_dram_gbps: CUDA is not available, returning 0.0.")
         return 0.0
-      
+
     from triton.testing import get_dram_gbps
-    
+
     return get_dram_gbps()
-     
+
 
 def get_gpu_shared_memory() -> int:
     from triton.runtime import driver
