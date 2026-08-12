@@ -243,6 +243,8 @@ class TestNCCL(TestCase):
 @instantiate_parametrized_tests
 @requires_cuda_p2p_access()
 class NCCLSymmetricMemoryTest(MultiProcContinuousTest):
+    hw_classification = HardwareClassification.CUDA
+
     @property
     def device(self) -> torch.device:
         return torch.device("cuda", self.rank)
@@ -1139,6 +1141,7 @@ class NCCLSymmetricMemoryNccl2Test(MultiProcContinuousTest):
     """
 
     backend_name = "nccl2"
+    hw_classification = HardwareClassification.CUDA
 
     @property
     def device(self) -> torch.device:
@@ -1192,6 +1195,7 @@ class NCCLSymmetricMemoryNccl2Test(MultiProcContinuousTest):
 
 class NCCLSymmetricMemoryNcclLazyTest(NCCLSymmetricMemoryNccl2Test):
     backend_name = "nccl-lazy"
+    hw_classification = HardwareClassification.CUDA
 
 
 instantiate_device_type_tests(TestNCCL, globals(), only_for="cuda")

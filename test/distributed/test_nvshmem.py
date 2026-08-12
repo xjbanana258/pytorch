@@ -17,6 +17,7 @@ from torch.testing._internal.common_distributed import (
     PLATFORM_SUPPORTS_SYMM_MEM,
 )
 from torch.testing._internal.common_utils import (
+    HardwareClassification,
     instantiate_parametrized_tests,
     parametrize,
     requires_cuda_p2p_access,
@@ -24,10 +25,6 @@ from torch.testing._internal.common_utils import (
     skip_but_pass_in_sandcastle_if,
     skipIfRocm,
 )
-try:
-    from torch.testing._internal.common_utils import HardwareClassification
-except ImportError:
-    HardwareClassification = None
 
 
 # Decorator
@@ -76,7 +73,7 @@ def skip_if_cuda_13_2():
 @requires_nvshmem()
 @requires_cuda_p2p_access()
 class NVSHMEMSymmetricMemoryTest(MultiProcContinuousTest):
-    hw_classification = HardwareClassification.CUDA if HardwareClassification else None
+    hw_classification = HardwareClassification.CUDA
 
     def _init_device(self) -> None:
         # TODO: relieve this (seems to hang if without)
@@ -396,7 +393,7 @@ class NVSHMEMSymmetricMemoryTest(MultiProcContinuousTest):
 @requires_nvshmem()
 @requires_cuda_p2p_access()
 class NVSHMEMAll2AllTest(MultiProcContinuousTest):
-    hw_classification = HardwareClassification.CUDA if HardwareClassification else None
+    hw_classification = HardwareClassification.CUDA
 
     def _init_device(self) -> None:
         # TODO: relieve this (seems to hang if without)
@@ -803,7 +800,7 @@ def dispatch_then_combine(device, align: int, group) -> None:
 @requires_nvshmem()
 @requires_cuda_p2p_access()
 class DispatchCombineTest(MultiProcContinuousTest):
-    hw_classification = HardwareClassification.CUDA if HardwareClassification else None
+    hw_classification = HardwareClassification.CUDA
 
     def _init_device(self) -> None:
         # TODO: relieve this (seems to hang if without)
@@ -831,7 +828,7 @@ class DispatchCombineTest(MultiProcContinuousTest):
 @requires_nvshmem()
 @requires_cuda_p2p_access()
 class DispatchCombineInSubgroups(MultiProcContinuousTest):
-    hw_classification = HardwareClassification.CUDA if HardwareClassification else None
+    hw_classification = HardwareClassification.CUDA
 
     def _init_device(self) -> None:
         # TODO: relieve this (seems to hang if without)
@@ -869,7 +866,7 @@ class DispatchCombineInSubgroups(MultiProcContinuousTest):
 @requires_nvshmem()
 @requires_cuda_p2p_access()
 class NVSHMEMTileCommTest(MultiProcContinuousTest):
-    hw_classification = HardwareClassification.CUDA if HardwareClassification else None
+    hw_classification = HardwareClassification.CUDA
 
     def _init_device(self) -> None:
         # TODO: relieve this (seems to hang if without)
